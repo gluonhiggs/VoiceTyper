@@ -1,0 +1,7 @@
+# Copy this file to `config.toml` (which is gitignored) and fill in your key.
+# The v1.1 settings UI will eventually write this file for you.
+#
+#   Copy-Item config.toml.example config.toml   # then edit config.toml
+
+groq_api_key = "gsk_your_groq_api_key_here"
+model = "whisper-large-v3-turbo"

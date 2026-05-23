@@ -99,6 +99,10 @@ fn main() {
         let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
         let mut stream: Option<cpal::Stream> = None;
 
+        // Groq config: read from a gitignored config.toml (the eventual settings
+        // button writes this same file), falling back to the GROQ_API_KEY env var.
+        let (api_key, model) = load_config();
+
         while let Ok(HookMsg::Toggle) = rx.recv() {
             if stream.is_none() {
                 buffer.lock().unwrap().clear();
@@ -145,6 +149,22 @@ fn main() {
                     samples.len(),
                     secs
                 );
+                match &api_key {
+                    Some(key) => {
+                        println!("transcribing via Groq ({model})...");
+                        let t0 = std::time::Instant::now();
+                        match transcribe("out.wav", key, &model) {
+                            Ok(text) => println!(
+                                "\n===== TRANSCRIPT ({:.1}s) =====\n{text}\n==============================\n",
+                                t0.elapsed().as_secs_f32()
+                            ),
+                            Err(e) => eprintln!("transcription failed: {e}"),
+                        }
+                    }
+                    None => {
+                        eprintln!("GROQ_API_KEY not set — skipping transcription. Set it and re-run.")
+                    }
+                }
             }
         }
     });
@@ -184,6 +204,27 @@ fn main() {
     });
 }
 
+/// POST a WAV file to Groq's Whisper endpoint and return the transcript text.
+fn transcribe(path: &str, api_key: &str, model: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let form = reqwest::blocking::multipart::Form::new()
+        .file("file", path)?
+        .text("model", model.to_string())
+        .text("response_format", "text") // plain-text body, no JSON to parse
+        .text("language", "en")
+        .text("temperature", "0");
+    let resp = reqwest::blocking::Client::new()
+        .post("https://api.groq.com/openai/v1/audio/transcriptions")
+        .bearer_auth(api_key)
+        .multipart(form)
+        .send()?;
+    let status = resp.status();
+    let body = resp.text()?;
+    if !status.is_success() {
+        return Err(format!("Groq API {status}: {body}").into());
+    }
+    Ok(body.trim().to_string())
+}
+
 /// Write f32 samples (interleaved, [-1,1]) to a 16-bit PCM WAV.
 fn write_wav(path: &str, samples: &[f32], sample_rate: u32, channels: u16) {
     let spec = hound::WavSpec {
@@ -208,4 +249,27 @@ fn make_icon() -> Icon {
         rgba.extend_from_slice(&[0x2e, 0x7d, 0xff, 0xff]);
     }
     Icon::from_rgba(rgba, w, h).expect("icon from_rgba")
+}
+
+/// App config, read from `config.toml` (gitignored). The v1.1 settings UI will
+/// write this same file. The key may instead come from the GROQ_API_KEY env var.
+#[derive(serde::Deserialize)]
+struct Config {
+    groq_api_key: Option<String>,
+    model: Option<String>,
+}
+
+/// Returns (api_key, model): config.toml if present, else env var / default.
+fn load_config() -> (Option<String>, String) {
+    let default_model = "whisper-large-v3-turbo".to_string();
+    if let Ok(text) = std::fs::read_to_string("config.toml") {
+        match toml::from_str::<Config>(&text) {
+            Ok(c) => {
+                let key = c.groq_api_key.or_else(|| std::env::var("GROQ_API_KEY").ok());
+                return (key, c.model.unwrap_or(default_model));
+            }
+            Err(e) => eprintln!("config.toml parse error: {e}"),
+        }
+    }
+    (std::env::var("GROQ_API_KEY").ok(), default_model)
 }
