@@ -1,0 +1,22 @@
+# Rust / Cargo
+/target
+
+# Recorded audio (test artifacts — keeps your voice out of git)
+out.wav
+*.wav
+
+# Local config & secrets — never commit the Groq API key.
+# Root-anchored so it does NOT ignore .cargo/config.toml (our build config).
+/config.toml
+config.local.json
+.env
+*.local
+
+# Editors / IDEs
+.idea/
+.vs/
+.vscode/
+
+# OS
+Thumbs.db
+desktop.ini

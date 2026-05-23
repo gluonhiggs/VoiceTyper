@@ -1,0 +1,13 @@
+# VoiceTyper builds for the x86_64-pc-windows-gnu target (GNU toolchain, no MSVC).
+#
+# Two things make the `windows` crate link on this target:
+#   1. A complete mingw-w64 on PATH (w64devkit) supplying a working `dlltool` +
+#      `as` — rustup's bundled "self-contained" toolchain lacks a usable `as`,
+#      so dlltool fails with "CreateProcess".
+#   2. This flag: force rustc's OWN bundled (self-contained) linker + libs.
+#      Without it, rustc grabs w64devkit's newer gcc/ld, whose libgcc_eh layout
+#      doesn't match rustc's mingw, and the link dies with "cannot find -lgcc_eh".
+#
+# So: keep w64devkit\bin on PATH, and keep this flag. See DESIGN.md decision log.
+[build]
+rustflags = ["-Clink-self-contained=yes"]

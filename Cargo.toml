@@ -1,0 +1,11 @@
+[package]
+name = "voicetyper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.17.3"
+hound = "3.5.1"
+tao = "0.35.3"
+tray-icon = "0.24.0"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader"] }
