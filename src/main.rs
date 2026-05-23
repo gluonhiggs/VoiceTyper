@@ -13,7 +13,11 @@ use tray_icon::{Icon, TrayIconBuilder};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LCONTROL, VK_LWIN, VK_RCONTROL, VK_RWIN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RWIN,
+    VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, SetWindowsHookExW, HC_ACTION, KBDLLHOOKSTRUCT, WH_KEYBOARD_LL, WM_KEYDOWN,
     WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
@@ -154,10 +158,15 @@ fn main() {
                         println!("transcribing via Groq ({model})...");
                         let t0 = std::time::Instant::now();
                         match transcribe("out.wav", key, &model) {
-                            Ok(text) => println!(
-                                "\n===== TRANSCRIPT ({:.1}s) =====\n{text}\n==============================\n",
-                                t0.elapsed().as_secs_f32()
-                            ),
+                            Ok(text) => {
+                                println!(
+                                    "\n===== TRANSCRIPT ({:.1}s) =====\n{text}\n==============================\n",
+                                    t0.elapsed().as_secs_f32()
+                                );
+                                if let Err(e) = inject(&text) {
+                                    eprintln!("inject failed: {e}");
+                                }
+                            }
                             Err(e) => eprintln!("transcription failed: {e}"),
                         }
                     }
@@ -223,6 +232,67 @@ fn transcribe(path: &str, api_key: &str, model: &str) -> Result<String, Box<dyn 
         return Err(format!("Groq API {status}: {body}").into());
     }
     Ok(body.trim().to_string())
+}
+
+/// Paste `text` into the focused window: snapshot the clipboard, set our text,
+/// send Ctrl+V, then restore the old clipboard. Text-only restore for now.
+fn inject(text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let mut clipboard = arboard::Clipboard::new()?;
+    let previous = clipboard.get_text().ok();
+    clipboard.set_text(text.to_string())?;
+    std::thread::sleep(std::time::Duration::from_millis(30)); // let the clipboard settle
+    wait_modifiers_released(); // avoid the held Win key turning Ctrl+V into Win+V
+    send_ctrl_v();
+    std::thread::sleep(std::time::Duration::from_millis(150)); // let the target app paste
+    if let Some(prev) = previous {
+        let _ = clipboard.set_text(prev);
+    }
+    Ok(())
+}
+
+/// Spin (briefly) until Ctrl/Win/Alt/Shift are all up, so the synthetic Ctrl+V
+/// isn't poisoned by a still-held modifier (e.g. Win+V opens clipboard history).
+fn wait_modifiers_released() {
+    let down = |vk: VIRTUAL_KEY| unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 };
+    for _ in 0..50 {
+        if !down(VK_CONTROL) && !down(VK_LWIN) && !down(VK_RWIN) && !down(VK_MENU) && !down(VK_SHIFT)
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Synthesize a Ctrl+V keystroke via SendInput.
+fn send_ctrl_v() {
+    const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
+    let inputs = [
+        key_event(VK_CONTROL, false),
+        key_event(VK_V, false),
+        key_event(VK_V, true),
+        key_event(VK_CONTROL, true),
+    ];
+    unsafe {
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+fn key_event(vk: VIRTUAL_KEY, up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: 0,
+                dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
 }
 
 /// Write f32 samples (interleaved, [-1,1]) to a 16-bit PCM WAV.
