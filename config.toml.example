@@ -5,3 +5,9 @@
 
 groq_api_key = "gsk_your_groq_api_key_here"
 model = "whisper-large-v3-turbo"
+
+# Dictation mode:
+#   "handsfree" = press Ctrl+Win once, talk; it types each sentence as you pause.
+#   "toggle"    = press to start, press to stop; types one clean transcription
+#                 (full context = better capitalization/punctuation).
+mode = "toggle"

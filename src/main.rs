@@ -1,7 +1,9 @@
+use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -23,6 +25,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
+// ── Tunables (energy VAD; tune by ear during testing) ─────────────────────────
+/// RMS above this = speech. f32 samples in [-1,1]; silence ~0.001, speech ~0.02+.
+const SPEECH_RMS: f32 = 0.012;
+/// Silence after speech that ends an utterance (cut a chunk).
+const CHUNK_GAP: Duration = Duration::from_millis(1500);
+/// Silence that ends the whole session (like Windows ~10s).
+const SESSION_GAP: Duration = Duration::from_secs(10);
+/// Ignore chunks shorter than this (accidental blips).
+const MIN_CHUNK_SECS: f32 = 0.3;
+/// How often the session loop wakes to inspect audio.
+const TICK: Duration = Duration::from_millis(100);
+
 /// Messages from the keyboard hook to the worker thread.
 enum HookMsg {
     Toggle,
@@ -39,9 +53,6 @@ static COMBO_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
-        // Track Ctrl/Win from the event stream rather than GetAsyncKeyState:
-        // inside an LL hook the async state for the *current* key may not be
-        // updated yet, which would miss the chord.
         let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         let vk = kb.vkCode;
         let msg = wparam.0 as u32;
@@ -64,7 +75,6 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
 
         let chord = CTRL_DOWN.load(Ordering::SeqCst) && WIN_DOWN.load(Ordering::SeqCst);
         if chord {
-            // Fire once when the chord first closes; re-arms on release below.
             if !COMBO_ACTIVE.swap(true, Ordering::SeqCst) {
                 if let Some(tx) = HOOK_TX.get() {
                     let _ = tx.send(HookMsg::Toggle);
@@ -82,104 +92,65 @@ fn main() {
     let (tx, rx) = mpsc::channel::<HookMsg>();
     HOOK_TX.set(tx).ok();
 
-    // Worker thread: owns the mic stream. Toggle starts capture into a shared
-    // buffer; toggle again stops it and writes out.wav. The cpal Stream is !Send,
-    // so it must be created and dropped here, never moved across threads.
+    // Worker thread: owns the mic stream and the hands-free session loop.
     thread::spawn(move || {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .expect("no default input device (microphone)");
-        let supported = device
-            .default_input_config()
-            .expect("no default input config");
-        let sample_rate = supported.sample_rate();
-        let channels = supported.channels();
-        let sample_format = supported.sample_format();
-        let config: cpal::StreamConfig = supported.into();
-
-        // Captured samples, normalized to f32 in [-1, 1]. Shared with the cpal
-        // callback thread.
+        let (api_key, model, handsfree) = load_config();
+        // Shared with the cpal callback; each session drains it.
         let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut stream: Option<cpal::Stream> = None;
 
-        // Groq config: read from a gitignored config.toml (the eventual settings
-        // button writes this same file), falling back to the GROQ_API_KEY env var.
-        let (api_key, model) = load_config();
-
-        while let Ok(HookMsg::Toggle) = rx.recv() {
-            if stream.is_none() {
-                buffer.lock().unwrap().clear();
-                let buf = buffer.clone();
-                let err_fn = |e| eprintln!("cpal stream error: {e}");
-                let s = match sample_format {
-                    cpal::SampleFormat::F32 => device.build_input_stream(
-                        &config,
-                        move |data: &[f32], _| buf.lock().unwrap().extend_from_slice(data),
-                        err_fn,
-                        None,
-                    ),
-                    cpal::SampleFormat::I16 => device.build_input_stream(
-                        &config,
-                        move |data: &[i16], _| {
-                            let mut b = buf.lock().unwrap();
-                            b.extend(data.iter().map(|&s| s as f32 / i16::MAX as f32));
-                        },
-                        err_fn,
-                        None,
-                    ),
-                    cpal::SampleFormat::U16 => device.build_input_stream(
-                        &config,
-                        move |data: &[u16], _| {
-                            let mut b = buf.lock().unwrap();
-                            b.extend(data.iter().map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0));
-                        },
-                        err_fn,
-                        None,
-                    ),
-                    other => panic!("unsupported sample format: {other:?}"),
-                }
-                .expect("failed to build input stream");
-                s.play().expect("failed to start stream");
-                stream = Some(s);
-                println!("TOGGLE -> RECORDING ({sample_rate} Hz, {channels} ch)");
-            } else {
-                stream = None; // dropping the stream stops capture
-                let samples = buffer.lock().unwrap().clone();
-                let secs = samples.len() as f32 / (sample_rate as f32 * channels as f32);
-                write_wav("out.wav", &samples, sample_rate, channels);
-                println!(
-                    "TOGGLE -> idle: wrote out.wav ({} samples, {:.1}s)",
-                    samples.len(),
-                    secs
-                );
-                match &api_key {
-                    Some(key) => {
-                        println!("transcribing via Groq ({model})...");
-                        let t0 = std::time::Instant::now();
-                        match transcribe("out.wav", key, &model) {
-                            Ok(text) => {
-                                println!(
-                                    "\n===== TRANSCRIPT ({:.1}s) =====\n{text}\n==============================\n",
-                                    t0.elapsed().as_secs_f32()
-                                );
-                                if let Err(e) = inject(&text) {
-                                    eprintln!("inject failed: {e}");
-                                }
-                            }
-                            Err(e) => eprintln!("transcription failed: {e}"),
-                        }
-                    }
-                    None => {
-                        eprintln!("GROQ_API_KEY not set — skipping transcription. Set it and re-run.")
-                    }
-                }
+        loop {
+            // Block until Ctrl+Win starts a session.
+            if rx.recv().is_err() {
+                return; // channel closed
             }
+
+            // Acquire the mic PER SESSION. A transient failure (mic unplugged,
+            // device busy) logs and waits for the next press, rather than the
+            // worker thread dying silently and recording never working again.
+            let device = match host.default_input_device() {
+                Some(d) => d,
+                None => {
+                    eprintln!("no microphone found — connect one and press Ctrl+Win again");
+                    continue;
+                }
+            };
+            let supported = match device.default_input_config() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("mic config error: {e} — press Ctrl+Win to retry");
+                    continue;
+                }
+            };
+            let in_rate = supported.sample_rate();
+            let channels = supported.channels();
+            let sample_format = supported.sample_format();
+            let config: cpal::StreamConfig = supported.into();
+
+            buffer.lock().unwrap().clear();
+            let stream = match build_stream(&device, &config, sample_format, buffer.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("couldn't open mic stream: {e} — press Ctrl+Win to retry");
+                    continue;
+                }
+            };
+            if let Err(e) = stream.play() {
+                eprintln!("couldn't start mic: {e} — press Ctrl+Win to retry");
+                continue;
+            }
+
+            if handsfree {
+                run_handsfree_session(&rx, &buffer, in_rate, channels, &api_key, &model);
+            } else {
+                run_toggle_session(&rx, &buffer, in_rate, channels, &api_key, &model);
+            }
+
+            drop(stream); // stops capture
         }
     });
 
-    // Install the global low-level keyboard hook. The returned HHOOK is kept for
-    // the process lifetime (we never unhook), so the hook stays installed.
+    // Install the global low-level keyboard hook (kept for process lifetime).
     unsafe {
         let hmod = GetModuleHandleW(PCWSTR::null()).expect("GetModuleHandleW failed");
         let hinstance = HINSTANCE(hmod.0);
@@ -194,7 +165,7 @@ fn main() {
 
     let _tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("VoiceTyper (spike)")
+        .with_tooltip("VoiceTyper")
         .with_icon(make_icon())
         .build()
         .unwrap();
@@ -213,12 +184,222 @@ fn main() {
     });
 }
 
-/// POST a WAV file to Groq's Whisper endpoint and return the transcript text.
-fn transcribe(path: &str, api_key: &str, model: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Hands-free: VAD cuts chunks at pauses and types each as you go. Returns when
+/// the user re-presses Ctrl+Win or after a long silence.
+fn run_handsfree_session(
+    rx: &Receiver<HookMsg>,
+    buffer: &Arc<Mutex<Vec<f32>>>,
+    in_rate: u32,
+    channels: u16,
+    api_key: &Option<String>,
+    model: &str,
+) {
+    println!("SESSION START — hands-free (Ctrl+Win to stop)");
+    let mut segment: Vec<f32> = Vec::new();
+    let mut had_speech = false;
+    let mut silence = Duration::ZERO;
+
+    loop {
+        if let Ok(HookMsg::Toggle) = rx.try_recv() {
+            if had_speech {
+                process_chunk(std::mem::take(&mut segment), in_rate, channels, api_key, model);
+            }
+            println!("SESSION END (Ctrl+Win)");
+            return;
+        }
+        thread::sleep(TICK);
+
+        let new = {
+            let mut b = buffer.lock().unwrap();
+            std::mem::take(&mut *b)
+        };
+
+        if !new.is_empty() && rms(&new) > SPEECH_RMS {
+            had_speech = true;
+            silence = Duration::ZERO;
+            segment.extend_from_slice(&new);
+        } else {
+            silence += TICK;
+            if had_speech {
+                segment.extend_from_slice(&new); // keep trailing audio
+            }
+        }
+
+        if had_speech && silence >= CHUNK_GAP {
+            process_chunk(std::mem::take(&mut segment), in_rate, channels, api_key, model);
+            had_speech = false;
+        }
+
+        if silence >= SESSION_GAP {
+            println!("SESSION END (silence timeout)");
+            return;
+        }
+    }
+}
+
+/// Toggle: record until the next Ctrl+Win, then transcribe the WHOLE utterance
+/// as one Groq call (full context = best capitalization/punctuation).
+fn run_toggle_session(
+    rx: &Receiver<HookMsg>,
+    buffer: &Arc<Mutex<Vec<f32>>>,
+    in_rate: u32,
+    channels: u16,
+    api_key: &Option<String>,
+    model: &str,
+) {
+    println!("RECORDING (toggle) — Ctrl+Win to stop");
+    loop {
+        if let Ok(HookMsg::Toggle) = rx.try_recv() {
+            break;
+        }
+        thread::sleep(TICK);
+    }
+    let all = {
+        let mut b = buffer.lock().unwrap();
+        std::mem::take(&mut *b)
+    };
+    process_chunk(all, in_rate, channels, api_key, model);
+    println!("SESSION END (toggle)");
+}
+
+/// Build a cpal input stream that appends normalized f32 samples to `buf`.
+fn build_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    fmt: cpal::SampleFormat,
+    buf: Arc<Mutex<Vec<f32>>>,
+) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
+    let err_fn = |e| eprintln!("cpal stream error: {e}");
+    let stream = match fmt {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            config,
+            move |d: &[f32], _| buf.lock().unwrap().extend_from_slice(d),
+            err_fn,
+            None,
+        )?,
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            config,
+            move |d: &[i16], _| {
+                let mut b = buf.lock().unwrap();
+                b.extend(d.iter().map(|&s| s as f32 / i16::MAX as f32));
+            },
+            err_fn,
+            None,
+        )?,
+        cpal::SampleFormat::U16 => device.build_input_stream(
+            config,
+            move |d: &[u16], _| {
+                let mut b = buf.lock().unwrap();
+                b.extend(d.iter().map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0));
+            },
+            err_fn,
+            None,
+        )?,
+        other => return Err(format!("unsupported sample format: {other:?}").into()),
+    };
+    Ok(stream)
+}
+
+/// One utterance: resample to 16kHz mono, encode WAV in memory, transcribe, inject.
+fn process_chunk(
+    samples: Vec<f32>,
+    in_rate: u32,
+    channels: u16,
+    api_key: &Option<String>,
+    model: &str,
+) {
+    let secs = samples.len() as f32 / (in_rate as f32 * channels as f32);
+    if secs < MIN_CHUNK_SECS {
+        return; // accidental blip
+    }
+    let Some(key) = api_key else {
+        eprintln!("GROQ_API_KEY / config.toml not set — can't transcribe");
+        return;
+    };
+    let mono16k = to_16k_mono(&samples, in_rate, channels);
+    let wav = encode_wav_16k_mono(&mono16k);
+    println!("chunk {:.1}s -> transcribing...", secs);
+    let t0 = Instant::now();
+    match transcribe_bytes(wav, key, model) {
+        Ok(text) if !text.trim().is_empty() => {
+            println!(">>> [{:.1}s] {text}", t0.elapsed().as_secs_f32());
+            let out = format!("{text} "); // trailing space separates chunks within + across sessions
+            if let Err(e) = inject(&out) {
+                eprintln!("inject failed: {e}");
+            }
+        }
+        Ok(_) => println!("(empty transcript — skipped)"),
+        Err(e) => eprintln!("transcription failed: {e}"),
+    }
+}
+
+/// RMS loudness of a sample block.
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+/// Downmix to mono and resample to 16kHz by averaging windows (crude anti-alias).
+fn to_16k_mono(samples: &[f32], in_rate: u32, channels: u16) -> Vec<f32> {
+    let ch = channels.max(1) as usize;
+    let mono: Vec<f32> = if ch > 1 {
+        samples
+            .chunks(ch)
+            .map(|f| f.iter().sum::<f32>() / ch as f32)
+            .collect()
+    } else {
+        samples.to_vec()
+    };
+    if in_rate == 16_000 || mono.is_empty() {
+        return mono;
+    }
+    let ratio = in_rate as f32 / 16_000.0;
+    let out_len = (mono.len() as f32 / ratio) as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let start = (i as f32 * ratio) as usize;
+        let end = (((i + 1) as f32 * ratio) as usize).min(mono.len()).max(start + 1);
+        let slice = &mono[start..end.min(mono.len())];
+        out.push(slice.iter().sum::<f32>() / slice.len() as f32);
+    }
+    out
+}
+
+/// Encode f32 mono samples ([-1,1], 16kHz) as a 16-bit PCM WAV in memory.
+fn encode_wav_16k_mono(samples: &[f32]) -> Vec<u8> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut cursor = Cursor::new(Vec::<u8>::new());
+    {
+        let mut w = hound::WavWriter::new(&mut cursor, spec).expect("wav writer");
+        for &s in samples {
+            let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            w.write_sample(v).expect("write sample");
+        }
+        w.finalize().expect("finalize wav");
+    }
+    cursor.into_inner()
+}
+
+/// POST WAV bytes to Groq's Whisper endpoint and return the transcript text.
+fn transcribe_bytes(
+    audio: Vec<u8>,
+    api_key: &str,
+    model: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let part = reqwest::blocking::multipart::Part::bytes(audio)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")?;
     let form = reqwest::blocking::multipart::Form::new()
-        .file("file", path)?
+        .part("file", part)
         .text("model", model.to_string())
-        .text("response_format", "text") // plain-text body, no JSON to parse
+        .text("response_format", "text")
         .text("language", "en")
         .text("temperature", "0");
     let resp = reqwest::blocking::Client::new()
@@ -243,10 +424,10 @@ fn inject(text: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut clipboard = arboard::Clipboard::new()?;
     let previous = clipboard.get_text().ok();
     clipboard.set_text(text.to_string())?;
-    std::thread::sleep(std::time::Duration::from_millis(30)); // let the clipboard settle
-    wait_modifiers_released(); // avoid the held Win key turning Ctrl+V into Win+V
+    thread::sleep(Duration::from_millis(30)); // let the clipboard settle
+    wait_modifiers_released(); // avoid a held Win key turning Ctrl+V into Win+V
     send_ctrl_v();
-    std::thread::sleep(std::time::Duration::from_millis(150)); // let the target app paste
+    thread::sleep(Duration::from_millis(150)); // let the target app paste
     if let Some(prev) = previous {
         let _ = clipboard.set_text(prev);
     }
@@ -262,7 +443,7 @@ fn wait_modifiers_released() {
         {
             return;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -295,22 +476,6 @@ fn key_event(vk: VIRTUAL_KEY, up: bool) -> INPUT {
     }
 }
 
-/// Write f32 samples (interleaved, [-1,1]) to a 16-bit PCM WAV.
-fn write_wav(path: &str, samples: &[f32], sample_rate: u32, channels: u16) {
-    let spec = hound::WavSpec {
-        channels,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
-    for &s in samples {
-        let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-        writer.write_sample(v).expect("write sample");
-    }
-    writer.finalize().expect("finalize wav");
-}
-
 fn make_icon() -> Icon {
     // 16x16 solid blue square — avoids needing an .ico file for the spike.
     let (w, h) = (16u32, 16u32);
@@ -327,19 +492,22 @@ fn make_icon() -> Icon {
 struct Config {
     groq_api_key: Option<String>,
     model: Option<String>,
+    /// "handsfree" (default) or "toggle".
+    mode: Option<String>,
 }
 
 /// Returns (api_key, model): config.toml if present, else env var / default.
-fn load_config() -> (Option<String>, String) {
+fn load_config() -> (Option<String>, String, bool) {
     let default_model = "whisper-large-v3-turbo".to_string();
     if let Ok(text) = std::fs::read_to_string("config.toml") {
         match toml::from_str::<Config>(&text) {
             Ok(c) => {
                 let key = c.groq_api_key.or_else(|| std::env::var("GROQ_API_KEY").ok());
-                return (key, c.model.unwrap_or(default_model));
+                let handsfree = c.mode.as_deref() != Some("toggle"); // default: hands-free
+                return (key, c.model.unwrap_or(default_model), handsfree);
             }
             Err(e) => eprintln!("config.toml parse error: {e}"),
         }
     }
-    (std::env::var("GROQ_API_KEY").ok(), default_model)
+    (std::env::var("GROQ_API_KEY").ok(), default_model, true)
 }
