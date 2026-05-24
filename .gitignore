@@ -12,6 +12,9 @@ config.local.json
 .env
 *.local
 
+# Screenshots — a settings-window screenshot can expose the API key (see image.png).
+*.png
+
 # Editors / IDEs
 .idea/
 .vs/

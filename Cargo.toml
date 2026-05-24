@@ -7,6 +7,7 @@ edition = "2024"
 arboard = { version = "3.6.1", default-features = false }
 cpal = "0.17.3"
 directories = "6.0.0"
+eframe = { version = "0.34.2", default-features = false, features = ["glow", "default_fonts"] }
 hound = "3.5.1"
 reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "multipart", "native-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }

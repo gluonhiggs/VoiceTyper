@@ -9,6 +9,7 @@ mod config;
 mod dictation;
 mod hotkey;
 mod inject;
+mod settings;
 mod transcribe;
 mod tray;
 
@@ -24,11 +25,18 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::TrayIconBuilder;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 
-use crate::config::{load_config, open_config};
+use crate::config::load_config;
 use crate::hotkey::HookMsg;
 use crate::tray::UiEvent;
 
 fn main() {
+    // Launched as the settings window (from the tray): run that and exit. It's a
+    // separate process so its native message loop never tangles with the tray's.
+    if std::env::args().skip(1).any(|a| a == "--settings") {
+        settings::run();
+        return;
+    }
+
     // hook (producer) -> worker (consumer)
     let (tx, rx) = mpsc::channel::<HookMsg>();
 
@@ -40,7 +48,6 @@ fn main() {
     // Worker thread: owns the mic stream and the session loops.
     thread::spawn(move || {
         let host = cpal::default_host();
-        let (api_key, model, handsfree) = load_config();
         // Shared with the cpal callback; each session drains it.
         let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -49,6 +56,10 @@ fn main() {
             if rx.recv().is_err() {
                 return; // channel closed
             }
+
+            // Re-read config on every press so a Save in the settings window applies
+            // on the next Ctrl+Win — no need to quit and relaunch the tray app.
+            let cfg = load_config();
 
             // Acquire the mic PER SESSION. A transient failure (mic unplugged,
             // device busy) logs and waits for the next press, rather than the
@@ -87,14 +98,19 @@ fn main() {
             }
 
             let _ = proxy.send_event(UiEvent::Listening);
-            if handsfree {
-                dictation::run_handsfree_session(
-                    &rx, &buffer, in_rate, channels, &api_key, &model, &proxy,
-                );
+            let ctx = dictation::SessionCtx {
+                rx: &rx,
+                buffer: &buffer,
+                in_rate,
+                channels,
+                api_key: &cfg.api_key,
+                model: &cfg.model,
+                proxy: &proxy,
+            };
+            if cfg.handsfree {
+                dictation::run_handsfree_session(&ctx, cfg.silence_timeout);
             } else {
-                dictation::run_toggle_session(
-                    &rx, &buffer, in_rate, channels, &api_key, &model, &proxy,
-                );
+                dictation::run_toggle_session(&ctx);
             }
             let _ = proxy.send_event(UiEvent::Idle);
 
@@ -107,7 +123,7 @@ fn main() {
 
     // Tray: Settings + Quit. The icon swaps idle<->listening<->processing on worker events.
     let menu = Menu::new();
-    let settings = MenuItem::new("Settings (edit config.toml)", true, None);
+    let settings = MenuItem::new("Settings", true, None);
     let quit = MenuItem::new("Quit VoiceTyper", true, None);
     menu.append(&settings).unwrap();
     menu.append(&quit).unwrap();
@@ -132,7 +148,7 @@ fn main() {
 
         if let Ok(ev) = menu_rx.try_recv() {
             if ev.id == *settings.id() {
-                open_config();
+                settings::open_settings();
             } else if ev.id == *quit.id() {
                 *control_flow = ControlFlow::Exit;
             }

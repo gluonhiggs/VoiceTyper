@@ -54,10 +54,10 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
 
         let chord = CTRL_DOWN.load(Ordering::SeqCst) && WIN_DOWN.load(Ordering::SeqCst);
         if chord {
-            if !COMBO_ACTIVE.swap(true, Ordering::SeqCst) {
-                if let Some(tx) = HOOK_TX.get() {
-                    let _ = tx.send(HookMsg::Toggle);
-                }
+            if !COMBO_ACTIVE.swap(true, Ordering::SeqCst)
+                && let Some(tx) = HOOK_TX.get()
+            {
+                let _ = tx.send(HookMsg::Toggle);
             }
         } else {
             COMBO_ACTIVE.store(false, Ordering::SeqCst);

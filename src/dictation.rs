@@ -27,10 +27,10 @@ use crate::tray::UiEvent;
 // ── Tunables (energy VAD; tune by ear during testing) ─────────────────────────
 /// RMS above this = speech. f32 samples in [-1,1]; silence ~0.001, speech ~0.02+.
 const SPEECH_RMS: f32 = 0.012;
-/// Silence after speech that ends an utterance (cut a chunk). Tuned to 2.5s
-/// (up from 1.5s) so mid-sentence thinking pauses don't fragment speech into
-/// tiny chunks — bigger chunks keep context, so caps/punctuation + accuracy hold up.
-const CHUNK_GAP: Duration = Duration::from_millis(2500);
+// The silence-after-speech that cuts a chunk (the "Silence timeout") is no longer
+// a const: it's the user's `silence_timeout` setting, passed into the session.
+// Bigger = mid-sentence thinking pauses don't fragment speech into tiny chunks
+// (more context per chunk = better caps/punctuation); smaller = snappier injects.
 /// Silence that ends the whole session (like Windows ~10s).
 const SESSION_GAP: Duration = Duration::from_secs(10);
 /// Ignore chunks shorter than this (accidental blips).
@@ -44,17 +44,22 @@ const PREROLL: Duration = Duration::from_millis(250);
 /// falling behind, so injected text is lagging behind what you're saying.
 const QUEUE_WARN: usize = 5;
 
+/// Everything a dictation session needs except its mode-specific knobs. Both
+/// session fns share these, so they travel together instead of as 7 loose args.
+pub struct SessionCtx<'a> {
+    pub rx: &'a Receiver<HookMsg>,
+    pub buffer: &'a Arc<Mutex<Vec<f32>>>,
+    pub in_rate: u32,
+    pub channels: u16,
+    pub api_key: &'a Option<String>,
+    pub model: &'a str,
+    pub proxy: &'a EventLoopProxy<UiEvent>,
+}
+
 /// Hands-free: VAD cuts chunks at pauses and types each as you go. Returns when
 /// the user re-presses Ctrl+Win or after a long silence.
-pub fn run_handsfree_session(
-    rx: &Receiver<HookMsg>,
-    buffer: &Arc<Mutex<Vec<f32>>>,
-    in_rate: u32,
-    channels: u16,
-    api_key: &Option<String>,
-    model: &str,
-    proxy: &EventLoopProxy<UiEvent>,
-) {
+pub fn run_handsfree_session(ctx: &SessionCtx, silence_timeout: Duration) {
+    let &SessionCtx { rx, buffer, in_rate, channels, api_key, model, proxy } = ctx;
     println!("SESSION START — hands-free (Ctrl+Win to stop)");
 
     // Producer/consumer split. THIS loop (producer) only runs the VAD and hands
@@ -119,7 +124,7 @@ pub fn run_handsfree_session(
             }
         }
 
-        if had_speech && silence >= CHUNK_GAP {
+        if had_speech && silence >= silence_timeout {
             enqueue_chunk(&chunk_tx, &depth, std::mem::take(&mut segment)); // hand off; never block
             had_speech = false;
         }
@@ -168,15 +173,8 @@ fn enqueue_chunk(tx: &Sender<Vec<f32>>, depth: &Arc<AtomicUsize>, seg: Vec<f32>)
 
 /// Toggle: record until the next Ctrl+Win, then transcribe the WHOLE utterance
 /// as one Groq call (full context = best capitalization/punctuation).
-pub fn run_toggle_session(
-    rx: &Receiver<HookMsg>,
-    buffer: &Arc<Mutex<Vec<f32>>>,
-    in_rate: u32,
-    channels: u16,
-    api_key: &Option<String>,
-    model: &str,
-    proxy: &EventLoopProxy<UiEvent>,
-) {
+pub fn run_toggle_session(ctx: &SessionCtx) {
+    let &SessionCtx { rx, buffer, in_rate, channels, api_key, model, proxy } = ctx;
     println!("RECORDING (toggle) — Ctrl+Win to stop");
     loop {
         if let Ok(HookMsg::Toggle) = rx.try_recv() {
