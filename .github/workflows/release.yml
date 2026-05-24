@@ -1,0 +1,54 @@
+name: Release
+
+# Build the installer automatically whenever you push a version tag (e.g. v0.2.0),
+# and attach VoiceTyper-Setup-<version>.exe to the GitHub Release for that tag.
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# CI builds with the MSVC toolchain (preinstalled on GitHub's windows runners) —
+# no w64devkit needed. The gnu-only link flag in .cargo/config.toml is scoped to
+# the gnu target, so it doesn't apply here; build.rs is gnu-gated and no-ops too.
+# +crt-static makes the MSVC exe self-contained (no VC++ redist needed).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the release and upload the installer asset
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+
+      - name: Build release exe
+        run: cargo build --release
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile installer (version from the git tag)
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=$version installer\voicetyper.iss
+
+      - name: Attach installer to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/Output/VoiceTyper-Setup-*.exe

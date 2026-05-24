@@ -1,3 +1,8 @@
+// Release builds are a GUI app (no console window). Debug keeps the console so
+// dev `cargo run` still shows the per-chunk logs. Without this, the tray app pops
+// an empty terminal window on launch — ugly for end users.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! VoiceTyper: press Ctrl+Win, speak, clean text lands in the focused app.
 //! Cloud-only (Groq Whisper), tray-only, Windows.
 //!

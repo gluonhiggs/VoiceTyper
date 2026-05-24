@@ -1,0 +1,19 @@
+# cargo-release config (https://github.com/crate-ci/cargo-release).
+#
+# VoiceTyper is a binary app, NOT a crates.io library, so publishing is OFF.
+# `cargo release <level>` only: bumps Cargo.toml, commits, tags vX.Y.Z, pushes.
+# The pushed tag triggers .github/workflows/release.yml, which builds the installer.
+#
+# Usage (DRY-RUN by default — add --execute to actually cut the release):
+#   cargo release patch              # 0.1.0 -> 0.1.1   bug fixes
+#   cargo release minor              # 0.1.0 -> 0.2.0   new features
+#   cargo release major              # 0.1.0 -> 1.0.0   big / breaking
+#   cargo release patch --execute    # do it for real
+#
+# Requires: a clean working tree, `git remote origin` set, and
+# `cargo install cargo-release` on this machine.
+
+publish = false            # never push to crates.io (this is an app, not a library)
+tag-name = "v{{version}}"  # must match release.yml's `on: push: tags: ['v*']`
+push = true                # push the release commit + tag to origin (fires CI)
+sign-tag = false           # no GPG signing required

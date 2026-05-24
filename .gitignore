@@ -15,6 +15,9 @@ config.local.json
 # Screenshots — a settings-window screenshot can expose the API key (see image.png).
 *.png
 
+# Installer build output (the compiled Setup.exe). The .iss script IS committed.
+installer/Output/
+
 # Editors / IDEs
 .idea/
 .vs/
