@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use tao::event_loop::{ControlFlow, EventLoop};
+use tao::event::Event;
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
@@ -37,9 +38,19 @@ const MIN_CHUNK_SECS: f32 = 0.3;
 /// How often the session loop wakes to inspect audio.
 const TICK: Duration = Duration::from_millis(100);
 
+/// Tray mic-glyph color: blue = idle, red = listening.
+const IDLE_RGBA: [u8; 4] = [0x2e, 0x7d, 0xff, 0xff];
+const LISTENING_RGBA: [u8; 4] = [0xff, 0x3b, 0x30, 0xff];
+
 /// Messages from the keyboard hook to the worker thread.
 enum HookMsg {
     Toggle,
+}
+
+/// Worker -> UI-thread events (drives the tray icon state).
+enum UiEvent {
+    Listening,
+    Idle,
 }
 
 // The WH_KEYBOARD_LL callback is a plain `extern "system" fn`, so it can't
@@ -92,7 +103,12 @@ fn main() {
     let (tx, rx) = mpsc::channel::<HookMsg>();
     HOOK_TX.set(tx).ok();
 
-    // Worker thread: owns the mic stream and the hands-free session loop.
+    // Typed event loop so the worker can push tray-icon state changes to the UI
+    // thread (the tray must be touched on the thread that owns it).
+    let event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
+
+    // Worker thread: owns the mic stream and the session loops.
     thread::spawn(move || {
         let host = cpal::default_host();
         let (api_key, model, handsfree) = load_config();
@@ -140,11 +156,13 @@ fn main() {
                 continue;
             }
 
+            let _ = proxy.send_event(UiEvent::Listening);
             if handsfree {
                 run_handsfree_session(&rx, &buffer, in_rate, channels, &api_key, &model);
             } else {
                 run_toggle_session(&rx, &buffer, in_rate, channels, &api_key, &model);
             }
+            let _ = proxy.send_event(UiEvent::Idle);
 
             drop(stream); // stops capture
         }
@@ -158,26 +176,39 @@ fn main() {
             .expect("SetWindowsHookExW failed");
     }
 
-    // Tray icon with a Quit item.
+    // Tray: Settings + Quit. The icon swaps idle<->listening on worker events.
     let menu = Menu::new();
+    let settings = MenuItem::new("Settings (edit config.toml)", true, None);
     let quit = MenuItem::new("Quit VoiceTyper", true, None);
+    menu.append(&settings).unwrap();
     menu.append(&quit).unwrap();
 
-    let _tray = TrayIconBuilder::new()
+    let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("VoiceTyper")
-        .with_icon(make_icon())
+        .with_icon(make_icon(IDLE_RGBA))
         .build()
         .unwrap();
 
     let menu_rx = MenuEvent::receiver();
 
-    // tao event loop: drives the Win32 message pump the LL hook depends on.
-    let event_loop = EventLoop::new();
-    event_loop.run(move |_event, _target, control_flow| {
+    // tao event loop: pumps the Win32 messages the LL hook needs, swaps the tray
+    // icon on worker state changes, and handles the tray menu.
+    event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
+
+        if let Event::UserEvent(ui) = event {
+            let rgba = match ui {
+                UiEvent::Listening => LISTENING_RGBA,
+                UiEvent::Idle => IDLE_RGBA,
+            };
+            let _ = tray.set_icon(Some(make_icon(rgba)));
+        }
+
         if let Ok(ev) = menu_rx.try_recv() {
-            if ev.id == *quit.id() {
+            if ev.id == *settings.id() {
+                open_config();
+            } else if ev.id == *quit.id() {
                 *control_flow = ControlFlow::Exit;
             }
         }
@@ -476,14 +507,48 @@ fn key_event(vk: VIRTUAL_KEY, up: bool) -> INPUT {
     }
 }
 
-fn make_icon() -> Icon {
-    // 16x16 solid blue square — avoids needing an .ico file for the spike.
-    let (w, h) = (16u32, 16u32);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for _ in 0..(w * h) {
-        rgba.extend_from_slice(&[0x2e, 0x7d, 0xff, 0xff]);
+/// Draw a 32x32 microphone glyph in `rgba` on a transparent background.
+/// Color encodes state (IDLE_RGBA = idle, LISTENING_RGBA = listening).
+///
+///   ▟▙     capsule (rounded mic body)
+///  (   )   cradle  (U-ring around the lower body)
+///    |     stem
+///   ───    base
+fn make_icon(rgba: [u8; 4]) -> Icon {
+    const S: usize = 32;
+    let mut px = vec![0u8; S * S * 4]; // transparent background
+    let cx = 16.0_f32;
+    for y in 0..S {
+        for x in 0..S {
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            let dx = fx - cx;
+            // Mic capsule: rounded vertical body (segment (16,9)-(16,15), r=5).
+            let cyy = fy.clamp(9.0, 15.0);
+            let head = (dx * dx + (fy - cyy) * (fy - cyy)).sqrt() <= 5.0;
+            // Cradle: lower half of a ring (r≈8) around (16,15).
+            let dr = (dx * dx + (fy - 15.0) * (fy - 15.0)).sqrt();
+            let cradle = (15.0..=23.0).contains(&fy) && (dr - 8.0).abs() <= 1.5;
+            // Stand: stem + base.
+            let stem = dx.abs() <= 1.5 && (22.0..=27.0).contains(&fy);
+            let base = dx.abs() <= 6.0 && (26.0..=28.0).contains(&fy);
+            if head || cradle || stem || base {
+                let i = (y * S + x) * 4;
+                px[i..i + 4].copy_from_slice(&rgba);
+            }
+        }
     }
-    Icon::from_rgba(rgba, w, h).expect("icon from_rgba")
+    Icon::from_rgba(px, S as u32, S as u32).expect("icon from_rgba")
+}
+
+/// Open config.toml in the OS default handler (the "Settings" tray item).
+fn open_config() {
+    let path = std::env::current_dir()
+        .map(|d| d.join("config.toml"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("config.toml"));
+    if let Some(p) = path.to_str() {
+        let _ = std::process::Command::new("explorer.exe").arg(p).spawn();
+    }
 }
 
 /// App config, read from `config.toml` (gitignored). The v1.1 settings UI will
