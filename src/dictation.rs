@@ -27,8 +27,10 @@ use crate::tray::UiEvent;
 // ── Tunables (energy VAD; tune by ear during testing) ─────────────────────────
 /// RMS above this = speech. f32 samples in [-1,1]; silence ~0.001, speech ~0.02+.
 const SPEECH_RMS: f32 = 0.012;
-/// Silence after speech that ends an utterance (cut a chunk).
-const CHUNK_GAP: Duration = Duration::from_millis(1500);
+/// Silence after speech that ends an utterance (cut a chunk). Tuned to 2.5s
+/// (up from 1.5s) so mid-sentence thinking pauses don't fragment speech into
+/// tiny chunks — bigger chunks keep context, so caps/punctuation + accuracy hold up.
+const CHUNK_GAP: Duration = Duration::from_millis(2500);
 /// Silence that ends the whole session (like Windows ~10s).
 const SESSION_GAP: Duration = Duration::from_secs(10);
 /// Ignore chunks shorter than this (accidental blips).
