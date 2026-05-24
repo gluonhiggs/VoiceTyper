@@ -10,8 +10,10 @@
 #
 # So: keep w64devkit\bin on PATH, and keep this flag. See DESIGN.md decision log.
 #
-# Scoped to the GNU target ONLY (not [build]) so it doesn't pollute the MSVC build
-# that GitHub Actions uses — MSVC has all import libs and doesn't need self-contained.
-# Local default host is gnu, so this still applies to every local `cargo build`.
-[target.x86_64-pc-windows-gnu]
+# MUST be [build], not [target.<triple>]: build scripts + proc-macros compile for the
+# host, and [target.*] rustflags don't reliably reach them, so a clean build (or
+# `cargo install`) fails with "cannot find -lgcc_eh". [build] applies to every rustc
+# invocation. GitHub Actions (MSVC) is unaffected — it sets the RUSTFLAGS env var,
+# which OVERRIDES this config entirely, so this gnu flag never touches the MSVC build.
+[build]
 rustflags = ["-Clink-self-contained=yes"]
