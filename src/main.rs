@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use tao::event::Event;
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
@@ -38,9 +38,10 @@ const MIN_CHUNK_SECS: f32 = 0.3;
 /// How often the session loop wakes to inspect audio.
 const TICK: Duration = Duration::from_millis(100);
 
-/// Tray mic-glyph color: blue = idle, red = listening.
+/// Tray mic-glyph color: blue = idle, red = listening, amber = processing.
 const IDLE_RGBA: [u8; 4] = [0x2e, 0x7d, 0xff, 0xff];
 const LISTENING_RGBA: [u8; 4] = [0xff, 0x3b, 0x30, 0xff];
+const PROCESSING_RGBA: [u8; 4] = [0xff, 0xa5, 0x00, 0xff];
 
 /// Messages from the keyboard hook to the worker thread.
 enum HookMsg {
@@ -48,8 +49,10 @@ enum HookMsg {
 }
 
 /// Worker -> UI-thread events (drives the tray icon state).
+/// Listening = capturing mic, Processing = uploading/transcribing, Idle = done.
 enum UiEvent {
     Listening,
+    Processing,
     Idle,
 }
 
@@ -158,9 +161,9 @@ fn main() {
 
             let _ = proxy.send_event(UiEvent::Listening);
             if handsfree {
-                run_handsfree_session(&rx, &buffer, in_rate, channels, &api_key, &model);
+                run_handsfree_session(&rx, &buffer, in_rate, channels, &api_key, &model, &proxy);
             } else {
-                run_toggle_session(&rx, &buffer, in_rate, channels, &api_key, &model);
+                run_toggle_session(&rx, &buffer, in_rate, channels, &api_key, &model, &proxy);
             }
             let _ = proxy.send_event(UiEvent::Idle);
 
@@ -200,6 +203,7 @@ fn main() {
         if let Event::UserEvent(ui) = event {
             let rgba = match ui {
                 UiEvent::Listening => LISTENING_RGBA,
+                UiEvent::Processing => PROCESSING_RGBA,
                 UiEvent::Idle => IDLE_RGBA,
             };
             let _ = tray.set_icon(Some(make_icon(rgba)));
@@ -224,6 +228,7 @@ fn run_handsfree_session(
     channels: u16,
     api_key: &Option<String>,
     model: &str,
+    proxy: &EventLoopProxy<UiEvent>,
 ) {
     println!("SESSION START — hands-free (Ctrl+Win to stop)");
     let mut segment: Vec<f32> = Vec::new();
@@ -233,6 +238,8 @@ fn run_handsfree_session(
     loop {
         if let Ok(HookMsg::Toggle) = rx.try_recv() {
             if had_speech {
+                // Final chunk: caller flips the icon to Idle right after we return.
+                let _ = proxy.send_event(UiEvent::Processing);
                 process_chunk(std::mem::take(&mut segment), in_rate, channels, api_key, model);
             }
             println!("SESSION END (Ctrl+Win)");
@@ -257,7 +264,10 @@ fn run_handsfree_session(
         }
 
         if had_speech && silence >= CHUNK_GAP {
+            // Mid-session chunk: amber while it uploads, back to red to keep listening.
+            let _ = proxy.send_event(UiEvent::Processing);
             process_chunk(std::mem::take(&mut segment), in_rate, channels, api_key, model);
+            let _ = proxy.send_event(UiEvent::Listening);
             had_speech = false;
         }
 
@@ -277,6 +287,7 @@ fn run_toggle_session(
     channels: u16,
     api_key: &Option<String>,
     model: &str,
+    proxy: &EventLoopProxy<UiEvent>,
 ) {
     println!("RECORDING (toggle) — Ctrl+Win to stop");
     loop {
@@ -289,6 +300,8 @@ fn run_toggle_session(
         let mut b = buffer.lock().unwrap();
         std::mem::take(&mut *b)
     };
+    // Amber during the ~1s upload+inject; caller flips to Idle right after we return.
+    let _ = proxy.send_event(UiEvent::Processing);
     process_chunk(all, in_rate, channels, api_key, model);
     println!("SESSION END (toggle)");
 }
@@ -542,10 +555,17 @@ fn make_icon(rgba: [u8; 4]) -> Icon {
 }
 
 /// Open config.toml in the OS default handler (the "Settings" tray item).
+/// On first run config.toml doesn't exist yet, so seed it from the committed
+/// config.toml.example template — otherwise the click is a silent no-op.
 fn open_config() {
-    let path = std::env::current_dir()
-        .map(|d| d.join("config.toml"))
-        .unwrap_or_else(|_| std::path::PathBuf::from("config.toml"));
+    let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let path = dir.join("config.toml");
+    if !path.exists() {
+        let example = dir.join("config.toml.example");
+        if let Err(e) = std::fs::copy(&example, &path) {
+            eprintln!("couldn't create config.toml from config.toml.example: {e}");
+        }
+    }
     if let Some(p) = path.to_str() {
         let _ = std::process::Command::new("explorer.exe").arg(p).spawn();
     }
