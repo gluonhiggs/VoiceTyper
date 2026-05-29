@@ -1,13 +1,13 @@
 //! Settings window: a separate `voicetyper --settings` process so its egui event
 //! loop never fights the tray's `tao` loop in the main process.
 //!
-//! Three fields the everyday user touches — Groq API key, mode, and the Silence
-//! timeout — written to `%APPDATA%\VoiceTyper\config.toml`. Model/language and the
+//! Four fields the everyday user touches — Groq API key, mode, Silence timeout,
+//! and language — written to `%APPDATA%\VoiceTyper\config.toml`. Model and the
 //! VAD sensitivity stay in the file (rarely changed; see TODOS.md).
 
 use eframe::egui;
 
-use crate::config::{self, MAX_SILENCE_SECS, MIN_SILENCE_SECS};
+use crate::config::{self, Language, MAX_SILENCE_SECS, MIN_SILENCE_SECS};
 
 /// Brand blue, shared with the tray icon's idle color (tray.rs IDLE_RGBA).
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2e, 0x7d, 0xff);
@@ -29,6 +29,7 @@ struct SettingsApp {
     api_key: String,
     handsfree: bool,
     silence_secs: f32,
+    language: Language,
     /// Set when a Save fails, shown in red under the fields.
     error: Option<String>,
 }
@@ -39,6 +40,7 @@ impl SettingsApp {
             api_key: cfg.api_key.unwrap_or_default(),
             handsfree: cfg.handsfree,
             silence_secs: cfg.silence_timeout.as_secs_f32(),
+            language: cfg.language,
             error: None,
         }
     }
@@ -47,7 +49,7 @@ impl SettingsApp {
     /// the timeout, so the slider's range is the only validation needed here.
     fn save(&mut self, ctx: &egui::Context) {
         let mode = if self.handsfree { "handsfree" } else { "toggle" };
-        match config::save_config(self.api_key.trim(), mode, self.silence_secs) {
+        match config::save_config(self.api_key.trim(), mode, self.silence_secs, self.language) {
             Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Err(e) => self.error = Some(format!("Couldn't save: {e}")),
         }
@@ -76,6 +78,13 @@ impl eframe::App for SettingsApp {
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut self.handsfree, true, "Hands-free");
                     ui.radio_value(&mut self.handsfree, false, "Toggle");
+                });
+                ui.add_space(10.0);
+
+                ui.label("Language");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.language, Language::English, "English");
+                    ui.radio_value(&mut self.language, Language::Vietnamese, "Vietnamese");
                 });
                 ui.add_space(10.0);
 

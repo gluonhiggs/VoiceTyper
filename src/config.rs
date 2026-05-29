@@ -9,6 +9,37 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Transcription language for the Groq Whisper API. The enum is the single
+/// source of the ISO-639-1 codes `"en"`/`"vi"` — nothing else in the codebase
+/// should hold these literals.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Language {
+    #[default]
+    English,
+    Vietnamese,
+}
+
+impl Language {
+    /// ISO-639-1 code sent to Groq.
+    pub fn code(self) -> &'static str {
+        match self {
+            Language::English => "en",
+            Language::Vietnamese => "vi",
+        }
+    }
+
+    /// Map a config-file code to a `Language`. Missing or unknown values
+    /// fall back to `English` — graceful, predictable, mirrors how `mode`
+    /// and `silence_timeout` handle bad input.
+    pub fn from_code(code: Option<&str>) -> Language {
+        match code {
+            Some("en") => Language::English,
+            Some("vi") => Language::Vietnamese,
+            _ => Language::English,
+        }
+    }
+}
+
 /// On-disk config shape (what `config.toml` literally contains). The settings
 /// window writes it; the key may instead come from the GROQ_API_KEY env var.
 #[derive(serde::Deserialize)]
@@ -19,6 +50,9 @@ struct RawConfig {
     mode: Option<String>,
     /// Hands-free silence (seconds) that ends a chunk. Clamped on read.
     silence_timeout_secs: Option<f32>,
+    /// ISO-639-1 transcription language code, e.g. "en" or "vi". Mapped to
+    /// `Language` by `Language::from_code` (unknown/missing -> English).
+    language: Option<String>,
 }
 
 /// Resolved, validated config the rest of the app runs on.
@@ -28,6 +62,8 @@ pub struct Config {
     pub handsfree: bool,
     /// Silence after speech that cuts a hands-free chunk (the "Silence timeout").
     pub silence_timeout: Duration,
+    /// Transcription language sent to Groq Whisper.
+    pub language: Language,
 }
 
 const DEFAULT_MODEL: &str = "whisper-large-v3-turbo";
@@ -46,6 +82,7 @@ impl Config {
             model: DEFAULT_MODEL.to_string(),
             handsfree: true,
             silence_timeout: Duration::from_secs_f32(DEFAULT_SILENCE_SECS),
+            language: Language::English,
         }
     }
 }
@@ -98,22 +135,30 @@ fn parse_config(text: &str) -> Config {
                 model: c.model.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
                 handsfree: c.mode.as_deref() != Some("toggle"), // default: hands-free
                 silence_timeout: Duration::from_secs_f32(secs),
+                language: Language::from_code(c.language.as_deref()),
             }
         }
         Err(_) => Config::defaults(),
     }
 }
 
-/// Set `groq_api_key`, `mode`, and `silence_timeout_secs` in the config text,
-/// preserving any other keys, comments, and formatting (toml_edit). Returns the
-/// new file contents.
-fn render_config(existing: &str, api_key: &str, mode: &str, silence_secs: f32) -> String {
+/// Set `groq_api_key`, `mode`, `silence_timeout_secs`, and `language` in the
+/// config text, preserving any other keys, comments, and formatting (toml_edit).
+/// Returns the new file contents.
+fn render_config(
+    existing: &str,
+    api_key: &str,
+    mode: &str,
+    silence_secs: f32,
+    language: Language,
+) -> String {
     let mut doc = existing
         .parse::<toml_edit::DocumentMut>()
         .unwrap_or_default();
     doc["groq_api_key"] = toml_edit::value(api_key);
     doc["mode"] = toml_edit::value(mode);
     doc["silence_timeout_secs"] = toml_edit::value(clamp_silence(silence_secs) as f64);
+    doc["language"] = toml_edit::value(language.code());
     if doc.get("model").is_none() {
         doc["model"] = toml_edit::value(DEFAULT_MODEL);
     }
@@ -138,13 +183,17 @@ pub fn save_config(
     api_key: &str,
     mode: &str,
     silence_secs: f32,
+    language: Language,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    std::fs::write(&path, render_config(&existing, api_key, mode, silence_secs))?;
+    std::fs::write(
+        &path,
+        render_config(&existing, api_key, mode, silence_secs, language),
+    )?;
     Ok(())
 }
 
@@ -153,7 +202,7 @@ pub fn save_config(
 pub fn open_config() {
     let path = config_path();
     if !path.exists() {
-        let _ = save_config("", "handsfree", DEFAULT_SILENCE_SECS);
+        let _ = save_config("", "handsfree", DEFAULT_SILENCE_SECS, Language::English);
     }
     if let Some(p) = path.to_str() {
         let _ = std::process::Command::new("explorer.exe").arg(p).spawn();
@@ -215,7 +264,7 @@ mod tests {
 
     #[test]
     fn render_then_parse_roundtrips() {
-        let text = render_config("", "sk-new", "toggle", 1.5);
+        let text = render_config("", "sk-new", "toggle", 1.5, Language::English);
         let c = parse_config(&text);
         assert_eq!(c.api_key.as_deref(), Some("sk-new"));
         assert!(!c.handsfree);
@@ -224,17 +273,61 @@ mod tests {
 
     #[test]
     fn render_clamps_out_of_range_silence() {
-        let c = parse_config(&render_config("", "k", "handsfree", 99.0));
+        let c = parse_config(&render_config("", "k", "handsfree", 99.0, Language::English));
         assert_eq!(secs(&c), MAX_SILENCE_SECS);
     }
 
     #[test]
     fn render_preserves_existing_model_and_comments() {
         let existing = "# my config\nmodel = \"custom-model\"\n";
-        let out = render_config(existing, "k", "handsfree", DEFAULT_SILENCE_SECS);
+        let out = render_config(existing, "k", "handsfree", DEFAULT_SILENCE_SECS, Language::English);
         assert!(out.contains("# my config")); // comment preserved
         let c = parse_config(&out);
         assert_eq!(c.api_key.as_deref(), Some("k"));
         assert_eq!(c.model, "custom-model"); // not clobbered
+    }
+
+    #[test]
+    fn language_code_maps_to_iso() {
+        assert_eq!(Language::English.code(), "en");
+        assert_eq!(Language::Vietnamese.code(), "vi");
+    }
+
+    #[test]
+    fn language_from_code_known_values() {
+        assert_eq!(Language::from_code(Some("en")), Language::English);
+        assert_eq!(Language::from_code(Some("vi")), Language::Vietnamese);
+    }
+
+    #[test]
+    fn language_from_code_unknown_or_missing_defaults_to_english() {
+        assert_eq!(Language::from_code(None), Language::English);
+        assert_eq!(Language::from_code(Some("xx")), Language::English);
+        assert_eq!(Language::from_code(Some("")), Language::English);
+    }
+
+    #[test]
+    fn parse_config_missing_language_defaults_to_english() {
+        let c = parse_config("groq_api_key = \"k\"\nmode = \"handsfree\"\n");
+        assert_eq!(c.language, Language::English);
+    }
+
+    #[test]
+    fn parse_config_vietnamese() {
+        let c = parse_config("language = \"vi\"\n");
+        assert_eq!(c.language, Language::Vietnamese);
+    }
+
+    #[test]
+    fn parse_config_unknown_language_falls_back_to_english() {
+        let c = parse_config("language = \"xx\"\n");
+        assert_eq!(c.language, Language::English);
+    }
+
+    #[test]
+    fn render_then_parse_preserves_vietnamese() {
+        let text = render_config("", "k", "handsfree", DEFAULT_SILENCE_SECS, Language::Vietnamese);
+        let c = parse_config(&text);
+        assert_eq!(c.language, Language::Vietnamese);
     }
 }

@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use tao::event_loop::EventLoopProxy;
 
 use crate::audio::{encode_wav_16k_mono, rms, to_16k_mono};
+use crate::config::Language;
 use crate::hotkey::HookMsg;
 use crate::inject::inject;
 use crate::transcribe::transcribe_bytes;
@@ -54,12 +55,13 @@ pub struct SessionCtx<'a> {
     pub api_key: &'a Option<String>,
     pub model: &'a str,
     pub proxy: &'a EventLoopProxy<UiEvent>,
+    pub language: Language,
 }
 
 /// Hands-free: VAD cuts chunks at pauses and types each as you go. Returns when
 /// the user re-presses Ctrl+Win or after a long silence.
 pub fn run_handsfree_session(ctx: &SessionCtx, silence_timeout: Duration) {
-    let &SessionCtx { rx, buffer, in_rate, channels, api_key, model, proxy } = ctx;
+    let &SessionCtx { rx, buffer, in_rate, channels, api_key, model, proxy, language } = ctx;
     println!("SESSION START — hands-free (Ctrl+Win to stop)");
 
     // Producer/consumer split. THIS loop (producer) only runs the VAD and hands
@@ -71,15 +73,17 @@ pub fn run_handsfree_session(ctx: &SessionCtx, silence_timeout: Duration) {
     let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<f32>>();
     let depth = Arc::new(AtomicUsize::new(0)); // chunks queued + in flight (backlog visibility)
     let consumer = {
-        let (api_key, model, proxy, depth) = (
-            api_key.clone(),
-            model.to_string(),
-            proxy.clone(),
-            depth.clone(),
-        );
-        thread::spawn(move || {
-            run_chunk_consumer(chunk_rx, in_rate, channels, api_key, model, proxy, depth)
-        })
+        let ctx = ConsumerCtx {
+            chunks: chunk_rx,
+            in_rate,
+            channels,
+            api_key: api_key.clone(),
+            model: model.to_string(),
+            language,
+            proxy: proxy.clone(),
+            depth: depth.clone(),
+        };
+        thread::spawn(move || run_chunk_consumer(ctx))
     };
 
     // Pre-roll: a rolling buffer of the most recent pre-speech audio, prepended
@@ -139,22 +143,31 @@ pub fn run_handsfree_session(ctx: &SessionCtx, silence_timeout: Duration) {
     let _ = consumer.join(); // wait so every queued chunk is transcribed + injected before Idle
 }
 
-/// Consumer thread: transcribe + inject queued chunks in spoken order, off the
-/// capture loop so the VAD never goes deaf during the Groq round-trip. Serialized
-/// (one consumer) because inject() touches the global clipboard. Flashes the icon
-/// amber per chunk; the worker sends Idle once this thread joins.
-fn run_chunk_consumer(
+/// Owned-fields bundle for the chunk consumer thread. Mirrors `SessionCtx`,
+/// but with owned values because the consumer thread takes ownership of the
+/// captured state.
+struct ConsumerCtx {
     chunks: Receiver<Vec<f32>>,
     in_rate: u32,
     channels: u16,
     api_key: Option<String>,
     model: String,
+    language: Language,
     proxy: EventLoopProxy<UiEvent>,
     depth: Arc<AtomicUsize>,
-) {
+}
+
+/// Consumer thread: transcribe + inject queued chunks in spoken order, off the
+/// capture loop so the VAD never goes deaf during the Groq round-trip. Serialized
+/// (one consumer) because inject() touches the global clipboard. Flashes the icon
+/// amber per chunk; the worker sends Idle once this thread joins.
+fn run_chunk_consumer(ctx: ConsumerCtx) {
+    let ConsumerCtx {
+        chunks, in_rate, channels, api_key, model, language, proxy, depth,
+    } = ctx;
     for samples in chunks {
         let _ = proxy.send_event(UiEvent::Processing);
-        process_chunk(samples, in_rate, channels, &api_key, &model);
+        process_chunk(samples, in_rate, channels, &api_key, &model, language);
         depth.fetch_sub(1, Ordering::Relaxed); // chunk done, shrink the backlog gauge
         let _ = proxy.send_event(UiEvent::Listening);
     }
@@ -174,7 +187,7 @@ fn enqueue_chunk(tx: &Sender<Vec<f32>>, depth: &Arc<AtomicUsize>, seg: Vec<f32>)
 /// Toggle: record until the next Ctrl+Win, then transcribe the WHOLE utterance
 /// as one Groq call (full context = best capitalization/punctuation).
 pub fn run_toggle_session(ctx: &SessionCtx) {
-    let &SessionCtx { rx, buffer, in_rate, channels, api_key, model, proxy } = ctx;
+    let &SessionCtx { rx, buffer, in_rate, channels, api_key, model, proxy, language } = ctx;
     println!("RECORDING (toggle) — Ctrl+Win to stop");
     loop {
         if let Ok(HookMsg::Toggle) = rx.try_recv() {
@@ -188,7 +201,7 @@ pub fn run_toggle_session(ctx: &SessionCtx) {
     };
     // Amber during the ~1s upload+inject; caller flips to Idle right after we return.
     let _ = proxy.send_event(UiEvent::Processing);
-    process_chunk(all, in_rate, channels, api_key, model);
+    process_chunk(all, in_rate, channels, api_key, model, language);
     println!("SESSION END (toggle)");
 }
 
@@ -199,6 +212,7 @@ fn process_chunk(
     channels: u16,
     api_key: &Option<String>,
     model: &str,
+    language: Language,
 ) {
     let secs = samples.len() as f32 / (in_rate as f32 * channels as f32);
     if secs < MIN_CHUNK_SECS {
@@ -212,7 +226,7 @@ fn process_chunk(
     let wav = encode_wav_16k_mono(&mono16k);
     println!("chunk {:.1}s -> transcribing...", secs);
     let t0 = Instant::now();
-    match transcribe_bytes(wav, key, model) {
+    match transcribe_bytes(wav, key, model, language.code()) {
         Ok(text) if !text.trim().is_empty() => {
             println!(">>> [{:.1}s] {text}", t0.elapsed().as_secs_f32());
             let out = format!("{text} "); // trailing space separates chunks within + across sessions

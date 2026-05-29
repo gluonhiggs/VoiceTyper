@@ -111,6 +111,7 @@ fn main() {
                 api_key: &cfg.api_key,
                 model: &cfg.model,
                 proxy: &proxy,
+                language: cfg.language,
             };
             if cfg.handsfree {
                 dictation::run_handsfree_session(&ctx, cfg.silence_timeout);
