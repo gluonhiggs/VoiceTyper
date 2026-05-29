@@ -1,6 +1,6 @@
 [package]
 name = "voicetyper"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 publish = false # binary app, never goes to crates.io (cargo + cargo-release both honor this)
 
